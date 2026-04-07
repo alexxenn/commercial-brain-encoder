@@ -42,24 +42,90 @@ DATASETS = {
         "name": "iEEG+fMRI+Video",
         "openneuro_id": "ds003688",
         "license": "CC0",
+        "commercial_verified": True,
         "modalities": ["bold", "ieeg"],
         "has_video": True,
-        "tr": 1.5,  # repetition time in seconds
+        "tr": 1.5,
+        "approx_gb": 17,  # actual: 16.7GB (30 subjects with BOLD)
+        "tsnr_threshold": 8.0,  # iEEG patients — metal electrodes cause artifacts, lower bar
+    },
+    "ds000113": {
+        "name": "StudyForrest — Forrest Gump fMRI",
+        "openneuro_id": "ds000113",
+        "license": "CC-BY-4.0",
+        "commercial_verified": True,
+        "modalities": ["bold"],
+        "has_video": True,  # 2h Forrest Gump film — aligned video available separately
+        "tr": 2.0,
+        "approx_gb": 22,   # ~15 subjects, 8 runs each
+        # NOTE: Best dataset for video encoder — 7,200 timepoints/subject vs 300 in ds003688
+        # Paradigm: naturalistic movie watching, same as our video input modality
+    },
+    "ds002345": {
+        "name": "Narratives — fMRI during spoken stories",
+        "openneuro_id": "ds002345",
+        "license": "CC0",
+        "commercial_verified": True,
+        "modalities": ["bold"],
+        "has_video": False,
+        "tr": 1.5,
+        "approx_gb": 30,
+    },
+    "ds006642": {
+        "name": "NNDb-3T+ — Back to the Future fMRI",
+        "openneuro_id": "ds006642",
+        "license": "CC-BY-4.0",
+        "commercial_verified": True,
+        "modalities": ["bold"],
+        "has_video": True,
+        "tr": 1.0,
+        "approx_gb": 25,
+    },
+    "ds004848": {
+        "name": "Game of Thrones fMRI",
+        "openneuro_id": "ds004848",
+        "license": "CC-BY-4.0",
+        "commercial_verified": True,
+        "modalities": ["bold"],
+        "has_video": True,
+        "tr": 2.0,
+        "approx_gb": 15,
+    },
+    "ds001499": {
+        "name": "BOLD5000",
+        "openneuro_id": "ds001499",
+        "license": "CC-BY-4.0",
+        "commercial_verified": True,
+        "modalities": ["bold"],
+        "has_video": False,
+        "tr": 2.0,
+        "approx_gb": 18,
+    },
+    "ds004192": {
+        "name": "THINGS-fMRI",
+        "openneuro_id": "ds004192",
+        "license": "CC-BY-4.0",
+        "commercial_verified": True,
+        "modalities": ["bold"],
+        "has_video": False,
+        "tr": 1.5,
         "approx_gb": 40,
     },
     "ds004499": {
         "name": "Movie fMRI",
         "openneuro_id": "ds004499",
         "license": "CC-BY-4.0",
+        "commercial_verified": True,
         "modalities": ["bold"],
         "has_video": True,
         "tr": 1.0,
-        "approx_gb": 380,
+        "approx_gb": 380,  # too large for initial training — add later
     },
     "ibc": {
         "name": "Individual Brain Charting",
-        "download_url": "https://openneuro.org/datasets/ds002685",
+        "openneuro_id": "ds002685",
         "license": "CC-BY-4.0",
+        "commercial_verified": True,
         "modalities": ["bold"],
         "has_video": False,
         "tr": 2.0,
@@ -297,8 +363,9 @@ class SubjectProcessor:
                 bold = load_bold(run_path)
                 tsnr = compute_temporal_snr(bold)
 
-                if tsnr < 15.0:
-                    log.warning(f"{self.subject_id}/{run_path.name}: tSNR={tsnr:.1f} < 15, skipping")
+                tsnr_threshold = self.config.get("tsnr_threshold", 15.0)
+                if tsnr < tsnr_threshold:
+                    log.warning(f"{self.subject_id}/{run_path.name}: tSNR={tsnr:.1f} < {tsnr_threshold}, skipping")
                     continue
 
                 bold = normalize_bold(bold)
