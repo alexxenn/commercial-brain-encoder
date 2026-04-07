@@ -1,0 +1,34 @@
+# CommercialBrainEncoder — Python dependencies
+# Run: pip install -r requirements.txt
+
+# Core data pipeline
+h5py>=3.10.0          # HDF5 read/write for superior_brain_data.h5
+nibabel>=5.2.0        # NIfTI fMRI file loading (.nii, .nii.gz)
+scipy>=1.12.0         # ndimage.zoom for BOLD resampling, HRF convolution
+tqdm>=4.66.0          # progress bars during dataset processing
+numpy>=1.26.0         # array ops throughout pipeline
+
+# Model — deep learning
+torch>=2.2.0          # core framework
+torchvision>=0.17.0   # video transforms
+torchaudio>=2.2.0     # audio processing utilities
+transformers>=4.38.0  # VideoMAE, Wav2Vec2 backbones from HuggingFace
+peft>=0.9.0           # LoRA via get_peft_model / LoraConfig
+accelerate>=0.27.0    # ADR-006: multi-GPU training, bf16, gradient clipping
+
+# Metrics
+torchmetrics>=1.3.0   # PearsonCorrCoef for val loop
+
+# Monitoring
+wandb>=0.16.0         # experiment tracking (offline fallback if no API key)
+rich>=13.7.0          # 4-panel live terminal display in monitor.py
+
+# Inference / demo (T3 — deploy_gradio.py, Wave 3b)
+gradio>=4.20.0        # Gradio demo interface
+matplotlib>=3.8.0     # 3-plane fMRI heatmap rendering in deploy_gradio.py
+Pillow>=10.2.0        # PIL Image output for Gradio image component
+boto3>=1.34.0         # OpenNeuro S3 anonymous download (no AWS CLI needed on Windows)
+
+# Testing
+pytest>=8.0.0         # test runner
+pytest-cov>=5.0.0     # coverage (optional)
