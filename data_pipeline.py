@@ -17,12 +17,28 @@ Usage:
 """
 
 import os
+import re
 import subprocess
 import logging
 import argparse
 import json
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Optional
+
+# ---------------------------------------------------------------------------
+# Security: dataset_id validation — prevents path traversal / S3 prefix injection
+# ---------------------------------------------------------------------------
+_DATASET_ID_RE = re.compile(r"^ds\d{6}$")
+
+
+def _validate_dataset_id(dataset_id: str) -> None:
+    """Raise ValueError if dataset_id is not a safe OpenNeuro identifier."""
+    if not _DATASET_ID_RE.match(dataset_id):
+        raise ValueError(
+            f"Invalid dataset_id '{dataset_id}'. "
+            "Must match ^ds\\d{{6}}$ (e.g. 'ds003688')."
+        )
 
 import numpy as np
 import h5py
@@ -175,6 +191,7 @@ def download_openneuro_boto3(
     Preferred on Windows — no CLI required, boto3 is already installed.
     Bucket: openneuro.org (us-east-1)
     """
+    _validate_dataset_id(dataset_id)
     import boto3
     from botocore import UNSIGNED
     from botocore.config import Config
@@ -224,6 +241,7 @@ def download_openneuro_aws(dataset_id: str, output_dir: Path, subjects: Optional
     NOTE: OpenNeuro S3 paths are: s3://openneuro.org/{dataset_id}/
     Use --no-sign-request for anonymous access.
     """
+    _validate_dataset_id(dataset_id)
     output_dir.mkdir(parents=True, exist_ok=True)
 
     if subjects:
@@ -251,6 +269,7 @@ def download_openneuro_aws(dataset_id: str, output_dir: Path, subjects: Optional
 
 def download_openneuro_datalad(dataset_id: str, output_dir: Path):
     """DataLad download (preferred — lazy fetch, only get what you need)."""
+    _validate_dataset_id(dataset_id)
     output_dir.mkdir(parents=True, exist_ok=True)
     url = f"https://github.com/OpenNeuroDatasets/{dataset_id}"
     log.info(f"Installing DataLad dataset {dataset_id}...")
@@ -348,66 +367,100 @@ class SubjectProcessor:
     def find_bold_runs(self) -> list[Path]:
         return sorted(self.subject_dir.rglob("*task-*_bold.nii.gz"))
 
-    def process(self) -> Optional[dict]:
+    def stream_runs(self):
+        """
+        Generator — yields (run_name, bold_array, tsnr) one run at a time.
+        Never holds more than one run in RAM. Caller writes each to HDF5 immediately.
+        """
         runs = self.find_bold_runs()
         if not runs:
             log.warning(f"{self.subject_id}: no BOLD runs found, skipping")
-            return None
+            return
 
-        all_bold = []
-        all_tsnr = []
-        processed_runs = []
-
+        tsnr_threshold = self.config.get("tsnr_threshold", 15.0)
         for run_path in runs:
             try:
                 bold = load_bold(run_path)
                 tsnr = compute_temporal_snr(bold)
 
-                tsnr_threshold = self.config.get("tsnr_threshold", 15.0)
                 if tsnr < tsnr_threshold:
                     log.warning(f"{self.subject_id}/{run_path.name}: tSNR={tsnr:.1f} < {tsnr_threshold}, skipping")
                     continue
 
                 bold = normalize_bold(bold)
                 bold = resample_to_standard(bold, self.target_shape)
-                all_bold.append(bold)
-                all_tsnr.append(tsnr)
-                processed_runs.append(run_path.name)
                 log.info(f"  {self.subject_id}/{run_path.name}: shape={bold.shape} tSNR={tsnr:.1f}")
+                yield run_path.name, bold, tsnr
 
             except Exception as e:
                 log.error(f"{self.subject_id}/{run_path.name}: {e}")
-                continue
-
-        if not all_bold:
-            return None
-
-        concatenated = np.concatenate(all_bold, axis=0)
-
-        return {
-            "bold": concatenated,           # (T_total, X, Y, Z)
-            "tsnr_values": all_tsnr,
-            "tsnr_mean": float(np.mean(all_tsnr)),
-            "n_timepoints": concatenated.shape[0],
-            "n_runs": len(processed_runs),
-            "runs": processed_runs,
-        }
+            finally:
+                # Explicit del so GC can free the array before the next run loads
+                try:
+                    del bold
+                except NameError:
+                    pass
 
 # ---------------------------------------------------------------------------
 # HDF5 writer
 # ---------------------------------------------------------------------------
 
-def write_to_h5(output_path: Path, dataset_id: str, subject_id: str, data: dict):
+def stream_subject_to_h5(
+    output_path: Path,
+    dataset_id: str,
+    processor: "SubjectProcessor",
+) -> bool:
+    """
+    Streams each run from processor directly into HDF5 — one run in RAM at a time.
+    Creates an extendable dataset and appends runs as they arrive.
+    Returns True if at least one run was written, False if subject was skipped.
+    """
+    grp_path = f"{dataset_id}/{processor.subject_id}"
+    tsnr_values: list[float] = []
+    run_names: list[str] = []
+    total_timepoints = 0
+    dataset_created = False
+
     with h5py.File(str(output_path), "a") as f:
-        grp_path = f"{dataset_id}/{subject_id}"
+        # Remove stale entry so resume is clean
         if grp_path in f:
             del f[grp_path]
         grp = f.require_group(grp_path)
-        grp.create_dataset("bold", data=data["bold"], compression="gzip", compression_opts=4)
-        grp.attrs["tsnr_mean"] = data["tsnr_mean"]
-        grp.attrs["n_timepoints"] = data["n_timepoints"]
-        grp.attrs["n_runs"] = data["n_runs"]
-        grp.attrs["runs"] = json.dumps(data["runs"])
+
+        for run_name, bold, tsnr in processor.stream_runs():
+            T, X, Y, Z = bold.shape
+            if not dataset_created:
+                # Create extendable dataset on first run
+                grp.create_dataset(
+                    "bold",
+                    data=bold,
+                    maxshape=(None, X, Y, Z),
+                    chunks=(min(T, 50), X, Y, Z),
+                    compression="gzip",
+                    compression_opts=1,
+                )
+                dataset_created = True
+            else:
+                # Extend and append subsequent runs
+                dset = grp["bold"]
+                old_len = dset.shape[0]
+                dset.resize(old_len + T, axis=0)
+                dset[old_len:] = bold
+
+            tsnr_values.append(tsnr)
+            run_names.append(run_name)
+            total_timepoints += T
+            # bold freed by stream_runs finally block
+
+        if not dataset_created:
+            return False  # no runs passed tSNR threshold
+
+        grp.attrs["tsnr_mean"] = float(np.mean(tsnr_values))
+        grp.attrs["n_timepoints"] = total_timepoints
+        grp.attrs["n_runs"] = len(run_names)
+        grp.attrs["runs"] = json.dumps(run_names)
+
+    return True
 
 # ---------------------------------------------------------------------------
 # Stats printer
@@ -453,6 +506,8 @@ def main():
                         help="Limit subjects per dataset (for testing)")
     parser.add_argument("--skip-download", action="store_true",
                         help="Skip download, process existing data")
+    parser.add_argument("--log-file", default=None,
+                        help="Write logs to this file (in addition to stdout) — use for background runs")
     parser.add_argument("--target-shape", default="64,64,48",
                         help="Target voxel shape X,Y,Z")
     args = parser.parse_args()
@@ -461,6 +516,11 @@ def main():
     output_path = Path(args.output)
     target_shape = tuple(int(x) for x in args.target_shape.split(","))
     dataset_ids = [d.strip() for d in args.datasets.split(",")]
+
+    if args.log_file:
+        fh = logging.FileHandler(args.log_file, encoding="utf-8")
+        fh.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+        logging.getLogger().addHandler(fh)
 
     # Check tools — boto3 preferred on Windows (no CLI needed)
     has_boto3 = check_boto3()
@@ -507,13 +567,26 @@ def main():
         if args.max_subjects:
             subject_dirs = subject_dirs[:args.max_subjects]
 
-        log.info(f"Processing {len(subject_dirs)} subjects from {dataset_id}...")
+        # Load existing subject keys so we can skip already-processed ones on resume
+        already_done: set[str] = set()
+        if output_path.exists():
+            with h5py.File(str(output_path), "r") as f:
+                if dataset_id in f:
+                    already_done = set(f[dataset_id].keys())
+            if already_done:
+                log.info(f"  Skipping {len(already_done)} already-processed subjects")
 
-        for sub_dir in tqdm(subject_dirs, desc=f"{dataset_id}"):
-            processor = SubjectProcessor(sub_dir, config, target_shape)
-            result = processor.process()
-            if result is not None:
-                write_to_h5(output_path, dataset_id, sub_dir.name, result)
+        remaining = [sd for sd in subject_dirs if sd.name not in already_done]
+        log.info(f"Processing {len(remaining)}/{len(subject_dirs)} subjects from {dataset_id} (streaming, 1 run in RAM at a time)...")
+
+        for sub_dir in tqdm(remaining, desc=f"{dataset_id}"):
+            try:
+                processor = SubjectProcessor(sub_dir, config, target_shape)
+                written = stream_subject_to_h5(output_path, dataset_id, processor)
+                if not written:
+                    log.warning(f"{sub_dir.name}: no valid runs, skipped")
+            except Exception as e:
+                log.error(f"{sub_dir.name}: {e}")
 
     print_dataset_stats(output_path)
     log.info(f"Pipeline complete → {output_path}")

@@ -17,6 +17,7 @@ ADRs honoured:
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import os
 import sys
@@ -45,7 +46,7 @@ from commercial_brain_encoder import (
     BrainEncoderLoss,
     CommercialBrainEncoder,
 )
-from monitor import TrainingMonitor
+from monitor import TrainingMonitor, build_approximate_roi_masks
 
 logging.basicConfig(
     level=logging.INFO,
@@ -213,6 +214,97 @@ def save_lora_adapters(model: CommercialBrainEncoder, checkpoint_dir: str | Path
 
 
 # ---------------------------------------------------------------------------
+# Training state checkpoint — pod restart resumption
+# ---------------------------------------------------------------------------
+
+def load_training_state(
+    checkpoint_dir: Path,
+    accelerator: Accelerator,
+) -> tuple[int, int, float]:
+    """
+    Restore training state from a checkpoint written by save_training_state().
+
+    Returns: (resumed_epoch, resumed_global_step, resumed_best_val_pearson)
+
+    Guard: if checkpoint_dir doesn't exist or training_state.json is missing,
+    returns (0, 0, -inf) so training starts fresh without crashing.
+    ADR-006: accelerator.load_state() handles device placement automatically.
+    """
+    json_path = checkpoint_dir / "training_state.json"
+    accel_state_path = checkpoint_dir / "accelerate_state"
+
+    if not checkpoint_dir.exists() or not json_path.exists():
+        logger.info(
+            "No checkpoint found at %s — starting fresh.", checkpoint_dir
+        )
+        return 0, 0, float("-inf")
+
+    with open(json_path) as f:
+        state = json.load(f)
+
+    resumed_epoch: int = int(state["epoch"]) + 1  # next epoch to run
+    resumed_global_step: int = int(state["global_step"])
+    resumed_best_val_pearson: float = float(state["best_val_pearson"])
+
+    if accel_state_path.exists():
+        accelerator.load_state(str(accel_state_path))
+        logger.info(
+            "Resumed from checkpoint: next_epoch=%d  global_step=%d  best_pearson=%.4f",
+            resumed_epoch,
+            resumed_global_step,
+            resumed_best_val_pearson,
+        )
+    else:
+        logger.warning(
+            "training_state.json found but accelerate_state/ missing at %s — "
+            "scalars restored but optimizer/scheduler reset to initial state.",
+            checkpoint_dir,
+        )
+
+    return resumed_epoch, resumed_global_step, resumed_best_val_pearson
+
+
+def save_training_state(
+    epoch: int,
+    global_step: int,
+    best_val_pearson: float,
+    checkpoint_dir: Path,
+    accelerator: Accelerator,
+) -> None:
+    """
+    Persist training state for RunPod pod restart resumption.
+
+    Writes into checkpoint_dir (alongside LoRA adapters from save_lora_adapters):
+      training_state.json   — epoch, global_step, best_val_pearson (scalars)
+      accelerate_state/     — optimizer + scheduler via accelerator.save_state()
+
+    ADR-002: does NOT replace save_lora_adapters() — LoRA adapters are the
+             deployable artifact; this is resumption state only (~100–200 MB).
+    ADR-006: accelerator.save_state() handles DDP device placement automatically.
+             Do NOT unwrap() before calling — Accelerate manages this internally.
+    """
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+
+    state = {
+        "epoch": epoch,
+        "global_step": global_step,
+        "best_val_pearson": best_val_pearson,
+    }
+    with open(checkpoint_dir / "training_state.json", "w") as f:
+        json.dump(state, f, indent=2)
+
+    accelerator.save_state(str(checkpoint_dir / "accelerate_state"))
+
+    logger.info(
+        "Training state saved: epoch=%d  global_step=%d  best_pearson=%.4f → %s",
+        epoch,
+        global_step,
+        best_val_pearson,
+        checkpoint_dir,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Argument parsing
 # ---------------------------------------------------------------------------
 
@@ -301,6 +393,16 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=0.23,
         help="Pearson r threshold for early stopping (ADR-005)",
+    )
+    parser.add_argument(
+        "--resume",
+        default=None,
+        metavar="CHECKPOINT_DIR",
+        help=(
+            "Resume training from this checkpoint dir (e.g. /workspace/checkpoints/best). "
+            "Expects training_state.json + accelerate_state/ written by save_training_state(). "
+            "If missing or path doesn't exist, starts fresh with no error."
+        ),
     )
     return parser.parse_args()
 
@@ -436,19 +538,52 @@ def main() -> None:
     best_lora_dir = checkpoint_dir / "best"
 
     # ------------------------------------------------------------------
+    # Resume from checkpoint (--resume flag, T2)
+    # load_training_state() is a no-op if path missing — starts fresh.
+    # ------------------------------------------------------------------
+    start_epoch = 0
+    global_step = 0
+    best_val_pearson: float = float("-inf")
+
+    if args.resume is not None and is_main:
+        resume_dir = Path(args.resume)
+        start_epoch, global_step, best_val_pearson = load_training_state(
+            checkpoint_dir=resume_dir,
+            accelerator=accelerator,
+        )
+
+    # Broadcast resume scalars to all processes so every rank skips the same epochs
+    start_epoch_t = torch.tensor(start_epoch, device=accelerator.device)
+    global_step_t = torch.tensor(global_step, device=accelerator.device)
+    best_pearson_t = torch.tensor(best_val_pearson, device=accelerator.device)
+    start_epoch_t = accelerator.reduce(start_epoch_t, reduction="max")
+    global_step_t = accelerator.reduce(global_step_t, reduction="max")
+    best_pearson_t = accelerator.reduce(best_pearson_t, reduction="max")
+    start_epoch = int(start_epoch_t.item())
+    global_step = int(global_step_t.item())
+    best_val_pearson = float(best_pearson_t.item())
+
+    # ------------------------------------------------------------------
     # Pearson r tracker for val
     # ------------------------------------------------------------------
     pearson_tracker = RunningPearsonR(device=accelerator.device)
 
     # ------------------------------------------------------------------
+    # ROI masks — approximate equal partition until brain_mask coordinates
+    # are saved by data_pipeline.py (replace with atlas-based masks then).
+    # ------------------------------------------------------------------
+    roi_masks = build_approximate_roi_masks(
+        num_voxels=config.num_voxels,
+        device=torch.device("cpu"),  # kept on CPU — pred/target gathered to CPU
+    )
+
+    # ------------------------------------------------------------------
     # Training loop (explicit — ADR-006)
     # ------------------------------------------------------------------
-    global_step = 0
-    best_val_pearson: float = float("-inf")
     stopped_early = False
 
     try:
-        for epoch in range(args.num_epochs):
+        for epoch in range(start_epoch, args.num_epochs):
             if stopped_early:
                 break
 
@@ -550,6 +685,17 @@ def main() -> None:
             if is_main:
                 val_pearson_r = pearson_tracker.compute()
 
+                # ROI-level Pearson r — uses accumulated CPU tensors from pearson_tracker
+                if monitor is not None and pearson_tracker._preds:
+                    all_pred = torch.cat(pearson_tracker._preds, dim=0)   # (N, num_voxels)
+                    all_tgt = torch.cat(pearson_tracker._targets, dim=0)  # (N, num_voxels)
+                    monitor.log_roi_pearson(
+                        pred=all_pred,
+                        target=all_tgt,
+                        roi_masks=roi_masks,
+                        step=global_step,
+                    )
+
             # Broadcast val_pearson_r to all processes for consistent early-stop decision
             val_r_tensor = torch.tensor(val_pearson_r, device=accelerator.device)
             val_r_tensor = accelerator.reduce(val_r_tensor, reduction="mean")
@@ -579,8 +725,15 @@ def main() -> None:
                     best_val_pearson = val_pearson_r
                     unwrapped = accelerator.unwrap_model(model)
                     save_lora_adapters(unwrapped, best_lora_dir)
+                    save_training_state(
+                        epoch=epoch,
+                        global_step=global_step,
+                        best_val_pearson=best_val_pearson,
+                        checkpoint_dir=best_lora_dir,
+                        accelerator=accelerator,
+                    )
                     logger.info(
-                        "New best val_pearson=%.4f — LoRA adapters saved to %s",
+                        "New best val_pearson=%.4f — LoRA adapters + training state saved to %s",
                         best_val_pearson,
                         best_lora_dir,
                     )

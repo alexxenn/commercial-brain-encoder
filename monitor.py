@@ -24,6 +24,56 @@ from typing import Any
 import torch
 
 # ---------------------------------------------------------------------------
+# ROI definitions — 10 functional categories matching Kairo benchmark ROIs.
+# Names align with standard neuroscience labelling for direct comparison.
+# ---------------------------------------------------------------------------
+ROI_NAMES: tuple[str, ...] = (
+    "visual",
+    "auditory",
+    "language",
+    "motor",
+    "emotion",
+    "reward",
+    "attention",
+    "executive",
+    "memory",
+    "self_referential",
+)
+
+
+def build_approximate_roi_masks(
+    num_voxels: int,
+    device: torch.device | None = None,
+) -> dict[str, torch.Tensor]:
+    """
+    Build approximate ROI masks by equal-partitioning the flat voxel space.
+
+    **Placeholder until spatial voxel→MNI mapping is available.**
+    Once data_pipeline.py stores a brain mask with voxel coordinates, replace
+    this with atlas-based masks (AAL/Brodmann) and the calling code needs no change.
+
+    Args:
+        num_voxels: Total number of predicted voxels (BrainEncoderConfig.num_voxels).
+        device: Target device for tensors. CPU if None.
+
+    Returns:
+        Dict mapping ROI name → ``(num_voxels,)`` bool tensor.
+        Each ROI covers a non-overlapping equal slice of the flat voxel space.
+    """
+    masks: dict[str, torch.Tensor] = {}
+    n = len(ROI_NAMES)
+    partition_size = num_voxels // n
+
+    for i, name in enumerate(ROI_NAMES):
+        mask = torch.zeros(num_voxels, dtype=torch.bool)
+        start = i * partition_size
+        end = start + partition_size if i < n - 1 else num_voxels
+        mask[start:end] = True
+        masks[name] = mask.to(device) if device is not None else mask
+
+    return masks
+
+# ---------------------------------------------------------------------------
 # Module-level logger — callers can configure the root logger as needed.
 # ---------------------------------------------------------------------------
 logger = logging.getLogger(__name__)
@@ -97,6 +147,33 @@ def _build_display_table(
         _format_metric(psnr) if psnr >= 0.0 else "-",
         f"{context_acc * 100:.1f}%" if context_acc >= 0.0 else "-",
     )
+    return table
+
+
+def _build_roi_table(roi_pearson: dict[str, float]) -> Table:
+    """Build a Rich Table showing per-ROI Pearson r values."""
+    table = Table(
+        show_header=True,
+        header_style="bold cyan",
+        title="[bold white]ROI Pearson r[/bold white]",
+        expand=True,
+    )
+    table.add_column("Region", style="dim", width=18)
+    table.add_column("Pearson r", justify="right")
+
+    for roi_name in ROI_NAMES:
+        r = roi_pearson.get(roi_name)
+        if r is None:
+            table.add_row(roi_name, "[dim]—[/dim]")
+        else:
+            # Colour: green ≥ 0.15, yellow ≥ 0.05, red < 0.05
+            if r >= 0.15:
+                style = "bold green"
+            elif r >= 0.05:
+                style = "yellow"
+            else:
+                style = "red"
+            table.add_row(roi_name, f"[{style}]{r:.4f}[/{style}]")
     return table
 
 
@@ -192,6 +269,7 @@ class TrainingMonitor:
         self._last_losses: dict[str, float] = {}
         self._last_psnr: float = -1.0      # -1 sentinel = not yet available
         self._last_context_acc: float = -1.0
+        self._last_roi_pearson: dict[str, float] = {}  # populated by log_roi_pearson()
 
         # Rich live display
         self._console: Console | None = None
@@ -268,16 +346,22 @@ class TrainingMonitor:
     # ------------------------------------------------------------------
 
     def _refresh_display(self) -> None:
-        """Re-render the live 4-panel display with latest cached values."""
+        """Re-render the live display: 4-panel metrics + optional ROI table."""
         if not _RICH_AVAILABLE or self._live is None:
             return
-        renderable = _build_four_panels(
+        from rich.console import Group  # local import — rich already guarded above
+
+        panels = _build_four_panels(
             step=self._last_step,
             pearson_r=self._last_pearson_r,
             losses=self._last_losses,
             psnr=self._last_psnr,
             context_acc=self._last_context_acc,
         )
+        if self._last_roi_pearson:
+            renderable = Group(panels, _build_roi_table(self._last_roi_pearson))
+        else:
+            renderable = panels
         self._live.update(renderable)
 
     # ------------------------------------------------------------------
@@ -355,59 +439,96 @@ class TrainingMonitor:
         if self._discord_webhook:
             self._send_discord(epoch, metrics)
 
-    def save_best(
+    def log_roi_pearson(
         self,
-        model: torch.nn.Module,
-        path: str | Path,
-        pearson_r: float,
+        pred: torch.Tensor,
+        target: torch.Tensor,
+        roi_masks: dict[str, torch.Tensor],
+        step: int | None = None,
     ) -> None:
         """
-        Save a model checkpoint only if ``pearson_r`` exceeds the current best.
+        Compute and log per-ROI Pearson r.
 
-        Tracks best internally across calls. Does NOT save if ``pearson_r``
-        is equal to or below the previous best.
+        Called once per validation epoch after ``pearson_tracker.compute()``.
 
         Args:
-            model: The PyTorch module to checkpoint
-                (``state_dict()`` only — full model not pickled).
-            path: Destination path for the ``.pt`` checkpoint file.
-            pearson_r: Validation Pearson r achieved at this checkpoint
-                (scalar float, shape: ``()``).
+            pred: Predicted voxel responses — shape ``(N, num_voxels)`` on CPU.
+            target: Target voxel responses — shape ``(N, num_voxels)`` on CPU.
+            roi_masks: Dict mapping ROI name → ``(num_voxels,)`` bool tensor.
+                Build with ``build_approximate_roi_masks()`` until spatial
+                voxel coordinates are available from data_pipeline.py.
+            step: Global step index for WandB ``roi/*/pearson_r`` metrics.
+        """
+        roi_pearson: dict[str, float] = {}
+
+        for roi_name, mask in roi_masks.items():
+            if not mask.any():
+                continue
+            pred_roi = pred[:, mask]    # (N, roi_voxels)
+            tgt_roi = target[:, mask]   # (N, roi_voxels)
+
+            # Per-sample Pearson r across ROI voxels — same formula as RunningPearsonR
+            pred_c = pred_roi - pred_roi.mean(dim=1, keepdim=True)
+            tgt_c = tgt_roi - tgt_roi.mean(dim=1, keepdim=True)
+            r = (pred_c * tgt_c).sum(dim=1) / (
+                pred_c.norm(dim=1) * tgt_c.norm(dim=1) + 1e-8
+            )  # (N,)
+            roi_pearson[roi_name] = float(r.mean().item())
+
+        # WandB — namespaced under roi/ for clean dashboard grouping
+        self._wandb_log(
+            {f"roi/{k}/pearson_r": v for k, v in roi_pearson.items()},
+            step=step,
+        )
+
+        # Cache for Rich display refresh
+        self._last_roi_pearson = roi_pearson
+        self._refresh_display()
+
+        logger.info("ROI pearson_r: %s", {k: f"{v:.4f}" for k, v in roi_pearson.items()})
+
+    def save_best(
+        self,
+        pearson_r: float,
+        checkpoint_path: str | Path | None = None,
+    ) -> bool:
+        """
+        Track best Pearson r and log to WandB. Returns True if this is a new best.
+
+        ADR-002: Checkpoint saving is the caller's responsibility — use
+        ``save_lora_adapters()`` in ``train_commercial.py``, NOT ``torch.save()``
+        here. This method is a pure tracker + notifier.
+
+        Args:
+            pearson_r: Validation Pearson r at this checkpoint.
+            checkpoint_path: Optional path for the Rich console "saved to" message.
+
+        Returns:
+            True if ``pearson_r`` exceeds the previous best, else False.
         """
         if pearson_r <= self._best_pearson_r:
             logger.debug(
-                "save_best: %.4f <= best %.4f — skipping",
+                "save_best: %.4f <= best %.4f — not a new best",
                 pearson_r,
                 self._best_pearson_r,
             )
-            return
-
-        save_path = Path(path)
-        save_path.parent.mkdir(parents=True, exist_ok=True)
-
-        torch.save(
-            {
-                "pearson_r": pearson_r,
-                "model_state_dict": model.state_dict(),
-            },
-            save_path,
-        )
+            return False
 
         logger.info(
-            "New best checkpoint: pearson_r=%.4f (prev=%.4f) → %s",
+            "New best pearson_r=%.4f (prev=%.4f)",
             pearson_r,
             self._best_pearson_r,
-            save_path,
         )
         self._best_pearson_r = pearson_r
-
         self._wandb_log({"best/pearson_r": pearson_r})
 
         if _RICH_AVAILABLE and self._console is not None:
+            loc = f" → [dim]{checkpoint_path}[/dim]" if checkpoint_path else ""
             self._console.print(
-                f"[bold green]New best:[/bold green] pearson_r={pearson_r:.4f} "
-                f"→ [dim]{save_path}[/dim]"
+                f"[bold green]New best:[/bold green] pearson_r={pearson_r:.4f}{loc}"
             )
+
+        return True
 
     def should_stop(
         self,

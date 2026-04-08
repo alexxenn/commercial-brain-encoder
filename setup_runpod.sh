@@ -121,11 +121,9 @@ echo "==> Writing accelerate_config.yaml..."
 cat > accelerate_config.yaml << 'EOF'
 compute_environment: LOCAL_MACHINE
 distributed_type: MULTI_GPU
-# Must match the GPU count asserted at the top of this script
 num_processes: 2
 # bf16 — ADR-006: A100 supports bf16 natively; better dynamic range than fp16
 mixed_precision: bf16
-# No DeepSpeed / FSDP for Phase 1 — plain DDP is enough at this scale
 zero_stage: 0
 gradient_accumulation_steps: 1
 EOF
@@ -156,6 +154,15 @@ if [[ -n "${DISCORD_WEBHOOK:-}" ]]; then
 fi
 
 # shellcheck disable=SC2086  # DISCORD_ARG intentionally word-splits to nothing when empty
+RESUME_ARG=""
+if [[ -f "${CHECKPOINT_DIR}/best/training_state.json" ]]; then
+    RESUME_ARG="--resume ${CHECKPOINT_DIR}/best"
+    echo "    Resuming from checkpoint: ${CHECKPOINT_DIR}/best"
+else
+    echo "    No checkpoint found — starting fresh"
+fi
+
+# shellcheck disable=SC2086  # RESUME_ARG and DISCORD_ARG intentionally word-split when empty
 accelerate launch \
     --config_file accelerate_config.yaml \
     --num_processes 2 \
@@ -166,6 +173,7 @@ accelerate launch \
     --batch-size 4 \
     --num-workers 4 \
     --wandb-project "commercial-brain-encoder" \
+    ${RESUME_ARG} \
     ${DISCORD_ARG}
 
 echo "==> Training complete. LoRA adapters at ${CHECKPOINT_DIR}/best/"

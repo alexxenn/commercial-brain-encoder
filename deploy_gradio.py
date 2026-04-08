@@ -182,16 +182,22 @@ def _validate_nifti_upload(
 ) -> None:
     """Validate uploaded file before nibabel touches it.
 
+    Checks (in order):
+      1. Extension — .nii or .nii.gz only (from browser-reported name)
+      2. File size — must be ≤ MAX_FILE_BYTES
+      3. Magic bytes — prevents extension-spoofing attacks:
+           .nii.gz → first 2 bytes must be gzip magic 0x1f 0x8b
+           .nii    → bytes 344-347 must be NIfTI magic b'n+1\\0' or b'ni1\\0'
+
     Args:
         original_filename: Original name as reported by the browser/Gradio
             (used for extension check — the tempfile path is not trusted).
         tmp_path: Filesystem path Gradio wrote the upload to.
 
     Raises:
-        ValueError: On extension mismatch or file-size violation.
+        ValueError: On extension mismatch, size violation, or magic byte failure.
     """
     fname = original_filename.lower()
-    # Accept both .nii and .nii.gz — check suffix carefully
     if not (fname.endswith(".nii") or fname.endswith(".nii.gz")):
         raise ValueError(
             f"Invalid file type: '{original_filename}'. "
@@ -204,6 +210,29 @@ def _validate_nifti_upload(
         raise ValueError(
             f"File too large: {size_mb:.1f} MB. Maximum allowed is 500 MB."
         )
+
+    # Magic byte check — reject files that lie about their extension
+    with open(tmp_path, "rb") as fh:
+        if fname.endswith(".nii.gz"):
+            magic = fh.read(2)
+            if magic != b"\x1f\x8b":
+                raise ValueError(
+                    "File does not appear to be a valid gzip archive. "
+                    "Ensure the file is a genuine .nii.gz NIfTI."
+                )
+        else:  # .nii (uncompressed)
+            # NIfTI-1 magic is at byte offset 344 — read just enough
+            if file_size < 348:
+                raise ValueError(
+                    "File too small to be a valid NIfTI-1 file (< 348 bytes)."
+                )
+            fh.seek(344)
+            nifti_magic = fh.read(4)
+            if nifti_magic not in (b"n+1\x00", b"ni1\x00"):
+                raise ValueError(
+                    "File does not contain a valid NIfTI-1 magic signature. "
+                    "Ensure the file is a genuine uncompressed .nii NIfTI."
+                )
 
     log.info(
         "File validation passed: '%s' (%.1f MB)",
