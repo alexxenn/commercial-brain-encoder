@@ -20,6 +20,7 @@ import argparse
 import json
 import logging
 import os
+import shutil
 import sys
 from pathlib import Path
 from typing import Iterator
@@ -234,32 +235,39 @@ def load_training_state(
     accel_state_path = checkpoint_dir / "accelerate_state"
 
     if not checkpoint_dir.exists() or not json_path.exists():
-        logger.info(
-            "No checkpoint found at %s — starting fresh.", checkpoint_dir
-        )
+        if accelerator.is_main_process:
+            logger.info("No checkpoint found at %s — starting fresh.", checkpoint_dir)
         return 0, 0, float("-inf")
 
-    with open(json_path) as f:
-        state = json.load(f)
+    # JSON read — main only, then broadcast.
+    if accelerator.is_main_process:
+        with open(json_path) as f:
+            state = json.load(f)
+        resumed_epoch = int(state["epoch"]) + 1
+        resumed_global_step = int(state["global_step"])
+        resumed_best_val_pearson = float(state["best_val_pearson"])
+    else:
+        resumed_epoch = 0
+        resumed_global_step = 0
+        resumed_best_val_pearson = float("-inf")
 
-    resumed_epoch: int = int(state["epoch"]) + 1  # next epoch to run
-    resumed_global_step: int = int(state["global_step"])
-    resumed_best_val_pearson: float = float(state["best_val_pearson"])
-
+    # accelerator.load_state is a COLLECTIVE op — all ranks must enter.
     if accel_state_path.exists():
         accelerator.load_state(str(accel_state_path))
-        logger.info(
-            "Resumed from checkpoint: next_epoch=%d  global_step=%d  best_pearson=%.4f",
-            resumed_epoch,
-            resumed_global_step,
-            resumed_best_val_pearson,
-        )
+        if accelerator.is_main_process:
+            logger.info(
+                "Resumed from checkpoint: next_epoch=%d  global_step=%d  best_pearson=%.4f",
+                resumed_epoch,
+                resumed_global_step,
+                resumed_best_val_pearson,
+            )
     else:
-        logger.warning(
-            "training_state.json found but accelerate_state/ missing at %s — "
-            "scalars restored but optimizer/scheduler reset to initial state.",
-            checkpoint_dir,
-        )
+        if accelerator.is_main_process:
+            logger.warning(
+                "training_state.json found but accelerate_state/ missing at %s — "
+                "scalars restored but optimizer/scheduler reset to initial state.",
+                checkpoint_dir,
+            )
 
     return resumed_epoch, resumed_global_step, resumed_best_val_pearson
 
@@ -274,34 +282,51 @@ def save_training_state(
     """
     Persist training state for RunPod pod restart resumption.
 
-    Writes into checkpoint_dir (alongside LoRA adapters from save_lora_adapters):
+    Multi-GPU safe:
+      - `accelerator.save_state()` is a collective op — ALL ranks must enter.
+      - JSON write + rename are rank-0 only.
+      - Atomic: writes to `<dir>_tmp/`, then rank 0 renames after barrier.
+
+    Writes into checkpoint_dir:
       training_state.json   — epoch, global_step, best_val_pearson (scalars)
       accelerate_state/     — optimizer + scheduler via accelerator.save_state()
-
-    ADR-002: does NOT replace save_lora_adapters() — LoRA adapters are the
-             deployable artifact; this is resumption state only (~100–200 MB).
-    ADR-006: accelerator.save_state() handles DDP device placement automatically.
-             Do NOT unwrap() before calling — Accelerate manages this internally.
     """
-    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    tmp_dir = checkpoint_dir.parent / (checkpoint_dir.name + "_tmp")
 
-    state = {
-        "epoch": epoch,
-        "global_step": global_step,
-        "best_val_pearson": best_val_pearson,
-    }
-    with open(checkpoint_dir / "training_state.json", "w") as f:
-        json.dump(state, f, indent=2)
+    # Clean up tmp from any prior crash, then ensure parent exists.
+    if accelerator.is_main_process:
+        if tmp_dir.exists():
+            shutil.rmtree(tmp_dir)
+        tmp_dir.mkdir(parents=True, exist_ok=True)
+    accelerator.wait_for_everyone()
 
-    accelerator.save_state(str(checkpoint_dir / "accelerate_state"))
+    # JSON scalars — main only.
+    if accelerator.is_main_process:
+        state = {
+            "epoch": epoch,
+            "global_step": global_step,
+            "best_val_pearson": best_val_pearson,
+        }
+        with open(tmp_dir / "training_state.json", "w") as f:
+            json.dump(state, f, indent=2)
 
-    logger.info(
-        "Training state saved: epoch=%d  global_step=%d  best_pearson=%.4f → %s",
-        epoch,
-        global_step,
-        best_val_pearson,
-        checkpoint_dir,
-    )
+    # COLLECTIVE — all ranks enter. Save into tmp.
+    accelerator.save_state(str(tmp_dir / "accelerate_state"))
+
+    # Atomic rename — main only, after every rank finished writing.
+    accelerator.wait_for_everyone()
+    if accelerator.is_main_process:
+        if checkpoint_dir.exists():
+            shutil.rmtree(checkpoint_dir)
+        tmp_dir.rename(checkpoint_dir)
+        logger.info(
+            "Training state saved: epoch=%d  global_step=%d  best_pearson=%.4f → %s",
+            epoch,
+            global_step,
+            best_val_pearson,
+            checkpoint_dir,
+        )
+    accelerator.wait_for_everyone()
 
 
 # ---------------------------------------------------------------------------
@@ -536,6 +561,7 @@ def main() -> None:
 
     checkpoint_dir = Path(args.checkpoint_dir)
     best_lora_dir = checkpoint_dir / "best"
+    latest_lora_dir = checkpoint_dir / "latest"
 
     # ------------------------------------------------------------------
     # Resume from checkpoint (--resume flag, T2)
@@ -545,7 +571,9 @@ def main() -> None:
     global_step = 0
     best_val_pearson: float = float("-inf")
 
-    if args.resume is not None and is_main:
+    # load_training_state contains a collective op (accelerator.load_state).
+    # ALL ranks must enter — main reads JSON, all enter load_state together.
+    if args.resume is not None:
         resume_dir = Path(args.resume)
         start_epoch, global_step, best_val_pearson = load_training_state(
             checkpoint_dir=resume_dir,
@@ -698,7 +726,8 @@ def main() -> None:
 
             # Broadcast val_pearson_r to all processes for consistent early-stop decision
             val_r_tensor = torch.tensor(val_pearson_r, device=accelerator.device)
-            val_r_tensor = accelerator.reduce(val_r_tensor, reduction="mean")
+            # Only rank 0 holds a real value; others are 0.0. max propagates rank 0's value.
+            val_r_tensor = accelerator.reduce(val_r_tensor, reduction="max")
             val_pearson_r = float(val_r_tensor.item())
 
             if is_main:
@@ -720,25 +749,61 @@ def main() -> None:
                     best_val_pearson,
                 )
 
-                # LoRA adapter checkpoint when val improves (ADR-002)
-                if val_pearson_r > best_val_pearson:
-                    best_val_pearson = val_pearson_r
-                    unwrapped = accelerator.unwrap_model(model)
-                    save_lora_adapters(unwrapped, best_lora_dir)
-                    save_training_state(
-                        epoch=epoch,
-                        global_step=global_step,
-                        best_val_pearson=best_val_pearson,
-                        checkpoint_dir=best_lora_dir,
-                        accelerator=accelerator,
-                    )
+                # Determine if this is a new best (will be broadcast below)
+                is_new_best = val_pearson_r > best_val_pearson
+            else:
+                is_new_best = False
+
+            # ----------------------------------------------------------------
+            # Checkpointing — must be OUTSIDE is_main because save_training_state
+            # contains a collective op. We broadcast is_new_best so all ranks
+            # take the same branch.
+            # ----------------------------------------------------------------
+
+            # Broadcast is_new_best to all ranks (reduce(sum) > 0 means any rank saw improvement).
+            is_new_best_t = torch.tensor(int(is_new_best), device=accelerator.device)
+            is_new_best_t = accelerator.reduce(is_new_best_t, reduction="sum")
+            is_new_best_all = is_new_best_t.item() > 0
+
+            # ALWAYS save latest/ checkpoint every epoch (P1-4 — protects against
+            # plateau + preemption). Collective op — all ranks enter.
+            if accelerator.is_main_process:
+                unwrapped_latest = accelerator.unwrap_model(model)
+                save_lora_adapters(unwrapped_latest, latest_lora_dir)
+            save_training_state(
+                epoch=epoch,
+                global_step=global_step,
+                best_val_pearson=best_val_pearson,
+                checkpoint_dir=latest_lora_dir,
+                accelerator=accelerator,
+            )
+
+            # Save best/ only on improvement. Collective op — all ranks enter.
+            if is_new_best_all:
+                if accelerator.is_main_process:
+                    best_val_pearson = val_pearson_r  # already broadcast via reduce(max) earlier
+                    unwrapped_best = accelerator.unwrap_model(model)
+                    save_lora_adapters(unwrapped_best, best_lora_dir)
+                # Broadcast updated best_val_pearson via reduce(max) so all ranks agree.
+                bv = torch.tensor(best_val_pearson, device=accelerator.device)
+                bv = accelerator.reduce(bv, reduction="max")
+                best_val_pearson = float(bv.item())
+                save_training_state(
+                    epoch=epoch,
+                    global_step=global_step,
+                    best_val_pearson=best_val_pearson,
+                    checkpoint_dir=best_lora_dir,
+                    accelerator=accelerator,
+                )
+                if accelerator.is_main_process:
                     logger.info(
                         "New best val_pearson=%.4f — LoRA adapters + training state saved to %s",
                         best_val_pearson,
                         best_lora_dir,
                     )
 
-                # ADR-005: early stop gate at Pearson r >= 0.23
+            # Early stop decision — main computes, all ranks reduce.
+            if accelerator.is_main_process:
                 if monitor is not None and monitor.should_stop(val_pearson_r, threshold=args.early_stop_threshold):
                     logger.info(
                         "Early stop triggered: val_pearson=%.4f >= threshold=%.4f",

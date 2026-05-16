@@ -155,9 +155,12 @@ fi
 
 # shellcheck disable=SC2086  # DISCORD_ARG intentionally word-splits to nothing when empty
 RESUME_ARG=""
-if [[ -f "${CHECKPOINT_DIR}/best/training_state.json" ]]; then
+if [[ -f "${CHECKPOINT_DIR}/latest/training_state.json" ]]; then
+    RESUME_ARG="--resume ${CHECKPOINT_DIR}/latest"
+    echo "    Resuming from latest checkpoint: ${CHECKPOINT_DIR}/latest"
+elif [[ -f "${CHECKPOINT_DIR}/best/training_state.json" ]]; then
     RESUME_ARG="--resume ${CHECKPOINT_DIR}/best"
-    echo "    Resuming from checkpoint: ${CHECKPOINT_DIR}/best"
+    echo "    Resuming from best checkpoint (no latest/ found): ${CHECKPOINT_DIR}/best"
 else
     echo "    No checkpoint found — starting fresh"
 fi
