@@ -85,7 +85,7 @@ DATASETS = {
         "modalities": ["bold"],
         "has_video": False,
         "tr": 1.5,
-        "approx_gb": 30,
+        "approx_gb": 134,  # actual: 134GB (345 subjects, full Narratives release)
     },
     "ds006642": {
         "name": "NNDb-3T+ — Back to the Future fMRI",
@@ -429,15 +429,18 @@ def stream_subject_to_h5(
 
         for run_name, bold, tsnr in processor.stream_runs():
             T, X, Y, Z = bold.shape
+            # float16 — 2x smaller than float32, fMRI SNR well within fp16 precision
+            bold_fp16 = bold.astype(np.float16)
             if not dataset_created:
                 # Create extendable dataset on first run
                 grp.create_dataset(
                     "bold",
-                    data=bold,
+                    data=bold_fp16,
                     maxshape=(None, X, Y, Z),
                     chunks=(min(T, 50), X, Y, Z),
                     compression="gzip",
-                    compression_opts=1,
+                    compression_opts=6,   # was 1 — ~2x better compression, 3x slower write
+                    shuffle=True,          # byte-shuffle filter, ~20% extra compression for free
                 )
                 dataset_created = True
             else:
@@ -445,7 +448,7 @@ def stream_subject_to_h5(
                 dset = grp["bold"]
                 old_len = dset.shape[0]
                 dset.resize(old_len + T, axis=0)
-                dset[old_len:] = bold
+                dset[old_len:] = bold_fp16
 
             tsnr_values.append(tsnr)
             run_names.append(run_name)
