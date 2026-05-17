@@ -63,12 +63,23 @@ mkdir -p "$(dirname "${DATA_PATH}")"
 # Subsequent packages use the default PyPI index.
 # pip install --upgrade is idempotent — re-running upgrades in-place.
 # ---------------------------------------------------------------------------
-echo "==> Installing PyTorch ecosystem (CUDA 12.1)..."
-pip install --upgrade \
-    torch>=2.2.0 \
-    torchvision>=0.17.0 \
-    torchaudio>=2.2.0 \
-    --index-url https://download.pytorch.org/whl/cu121
+# GPU-aware: Blackwell (sm_120, RTX 5090 / B200) needs cu128 nightly.
+# Ampere/Hopper (A100/H100) work with cu121 stable.
+echo "==> Detecting GPU compute capability..."
+GPU_CAP=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader | head -1 | tr -d '.')
+echo "  Compute capability: ${GPU_CAP}"
+if [[ "${GPU_CAP}" -ge 100 ]]; then
+    echo "==> Blackwell detected — installing PyTorch nightly cu128..."
+    pip install --pre --upgrade torch torchvision torchaudio \
+        --index-url https://download.pytorch.org/whl/nightly/cu128
+else
+    echo "==> Installing PyTorch stable cu121..."
+    pip install --upgrade \
+        torch>=2.2.0 \
+        torchvision>=0.17.0 \
+        torchaudio>=2.2.0 \
+        --index-url https://download.pytorch.org/whl/cu121
+fi
 
 echo "==> Installing HuggingFace + training deps..."
 pip install --upgrade \
@@ -118,14 +129,14 @@ print('  Model weights cached.')
 # num_processes=2 targets the 2×A100 pod.
 # ---------------------------------------------------------------------------
 echo "==> Writing accelerate_config.yaml..."
+# Accelerate 1.x is strict about unknown keys — `zero_stage` is DEEPSPEED-only,
+# `gradient_accumulation_steps` is launch-arg only in this version. Omit both.
 cat > accelerate_config.yaml << 'EOF'
 compute_environment: LOCAL_MACHINE
 distributed_type: MULTI_GPU
 num_processes: 2
-# bf16 — ADR-006: A100 supports bf16 natively; better dynamic range than fp16
+# bf16 — ADR-006: A100/Blackwell support bf16 natively; better dynamic range than fp16
 mixed_precision: bf16
-zero_stage: 0
-gradient_accumulation_steps: 1
 EOF
 echo "  accelerate_config.yaml written."
 

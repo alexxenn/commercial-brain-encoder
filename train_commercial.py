@@ -31,7 +31,7 @@ from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import DataLoader, Dataset, random_split
 
-from accelerate import Accelerator
+from accelerate import Accelerator, DistributedDataParallelKwargs
 from torchmetrics import PearsonCorrCoef
 
 # ---------------------------------------------------------------------------
@@ -87,7 +87,10 @@ class BoldWindowDataset(Dataset):
         with h5py.File(self._h5_path, "r") as f:
             for dataset_id in f.keys():
                 for subject_id in f[dataset_id].keys():
-                    n_tp: int = int(f[f"{dataset_id}/{subject_id}"].attrs["n_timepoints"])
+                    grp = f[f"{dataset_id}/{subject_id}"]
+                    if "bold" not in grp:
+                        continue  # skip subjects with no BOLD data
+                    n_tp: int = int(grp.attrs["n_timepoints"])
                     # Stride = 1 (dense windows). Adjust stride for less overlap.
                     for t in range(0, n_tp - self.WINDOW_SIZE + 1):
                         self._index.append((dataset_id, subject_id, t))
@@ -110,18 +113,28 @@ class BoldWindowDataset(Dataset):
         key = f"{dataset_id}/{subject_id}/bold"
 
         with h5py.File(self._h5_path, "r") as f:
-            # Load centre frame only for BOLD input — shape (X, Y, Z)
             t_centre = t_start + self.WINDOW_SIZE // 2
-            bold_vol = torch.from_numpy(
-                f[key][t_centre].astype("float32")  # (64, 64, 48)
-            )
+            try:
+                # Load centre frame only for BOLD input — shape (X, Y, Z)
+                bold_vol = torch.from_numpy(
+                    f[key][t_centre].astype("float32")  # (64, 64, 48)
+                )
+            except OSError:
+                # Corrupt gzip chunk — return zeros so training continues.
+                # Tracked as a known limitation of the v1 h5 (some chunks
+                # have bad bytes). Will be eliminated when h5 is reprocessed
+                # with the fp16+gzip-6+shuffle pipeline (commit 3d86f21).
+                bold_vol = torch.zeros(64, 64, 48, dtype=torch.float32)
 
         bold = bold_vol.unsqueeze(0)  # (1, 64, 64, 48)
 
-        # TODO: replace with aligned video frames from stimulus log
-        video = torch.randn(3, self.WINDOW_SIZE, 224, 224, dtype=torch.float32)
+        # TODO(Phase 5 — see REAL_TRAINING_PLAN.md): replace placeholder video
+        # with torch.zeros (audio-only datasets) or aligned video frames.
+        # Shape order is (T, C, H, W) — VideoMAE reads channels at dim 2.
+        video = torch.randn(self.WINDOW_SIZE, 3, 224, 224, dtype=torch.float32)
 
-        # TODO: replace with aligned audio waveform (5s at 16kHz)
+        # TODO(Phase 5 — see REAL_TRAINING_PLAN.md): replace placeholder noise
+        # with audio window from {ds}/{sub}/audio (5s, 80000 samples @ 16kHz).
         audio = torch.randn(80000, dtype=torch.float32)
 
         return {"bold": bold, "video": video, "audio": audio}
@@ -144,7 +157,8 @@ class SyntheticBoldDataset(Dataset):
         torch.manual_seed(idx)
         return {
             "bold": torch.randn(1, 64, 64, 48, dtype=torch.float32),
-            "video": torch.randn(3, 16, 224, 224, dtype=torch.float32),
+            # VideoMAE expects (T, C, H, W) — channels at dim 2 after batching.
+            "video": torch.randn(16, 3, 224, 224, dtype=torch.float32),
             "audio": torch.randn(80000, dtype=torch.float32),
         }
 
@@ -464,8 +478,12 @@ def main() -> None:
 
     # ------------------------------------------------------------------
     # Accelerator (ADR-006, bf16, 2×GPU)
+    # find_unused_parameters=True: recon_head + context_head are inactive by
+    # default (ADR-007/008 — deferred to post-training). Their params never
+    # receive gradients, which would crash DDP's AllReduce without this flag.
     # ------------------------------------------------------------------
-    accelerator = Accelerator(mixed_precision="bf16")
+    ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
+    accelerator = Accelerator(mixed_precision="bf16", kwargs_handlers=[ddp_kwargs])
     is_main = accelerator.is_main_process
 
     if is_main:
